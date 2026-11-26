@@ -142,18 +142,66 @@ function sendTextMessage() {
   chatInput.value = '';
   sendBtn.disabled = true;
   
-  // Connect WebSocket if not connected
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    connect();
-  }
-  
-  // Send to backend
+  const payload = JSON.stringify({ type: 'text', text: text });
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({
-      type: 'text',
-      text: text
-    }));
+    ws.send(payload);
+  } else {
+    connect();
+    ws.addEventListener('open', function() { ws.send(payload); }, { once: true });
   }
+}
+
+// Audio: Gemini returns 24 kHz 16-bit mono PCM
+let playCtx = null;
+let playTime = 0;
+let activeSources = [];
+
+function playPcm(buffer) {
+  if (!playCtx) playCtx = new AudioContext({ sampleRate: 24000 });
+  const int16 = new Int16Array(buffer);
+  const audioBuf = playCtx.createBuffer(1, int16.length, 24000);
+  const ch = audioBuf.getChannelData(0);
+  for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 32768;
+  const src = playCtx.createBufferSource();
+  src.buffer = audioBuf;
+  src.connect(playCtx.destination);
+  playTime = Math.max(playTime, playCtx.currentTime);
+  src.start(playTime);
+  playTime += audioBuf.duration;
+  activeSources.push(src);
+  src.onended = () => { activeSources = activeSources.filter(s => s !== src); };
+}
+
+function stopPlayback() {
+  activeSources.forEach(s => { try { s.stop(); } catch (e) {} });
+  activeSources = [];
+  playTime = 0;
+}
+
+// Microphone capture -> 16 kHz PCM over WebSocket
+let micCtx = null;
+let micStream = null;
+
+async function startMic() {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true }
+  });
+  micCtx = new AudioContext();
+  await micCtx.audioWorklet.addModule('pcm-processor.js');
+  const source = micCtx.createMediaStreamSource(micStream);
+  const node = new AudioWorkletNode(micCtx, 'pcm-processor');
+  node.port.onmessage = (e) => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data.pcm);
+  };
+  source.connect(node);
+  if (playCtx && playCtx.state === 'suspended') playCtx.resume();
+}
+
+function stopMic() {
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  if (micCtx) micCtx.close();
+  micStream = null;
+  micCtx = null;
 }
 
 // Connect to WebSocket
@@ -164,6 +212,7 @@ function connect() {
   console.log('[WS] Connecting to', url);
   
   ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
   
   ws.onopen = function() {
     console.log('[WS] Connected');
@@ -171,6 +220,10 @@ function connect() {
   };
   
   ws.onmessage = function(event) {
+    if (event.data instanceof ArrayBuffer) {
+      playPcm(event.data);
+      return;
+    }
     console.log('[WS] Message:', event.data);
     
     try {
@@ -178,6 +231,13 @@ function connect() {
       
       if (data.type === 'text') {
         addMessage('assistant', data.text);
+        sendBtn.disabled = chatInput.value.trim().length === 0;
+      } else if (data.type === 'user') {
+        addMessage('user', data.text);
+      } else if (data.type === 'tool' && data.event) {
+        addMessage('assistant', '🔧 ' + data.event.title + ': ' + data.event.summary);
+      } else if (data.type === 'interrupted') {
+        stopPlayback();
       } else if (data.type === 'error') {
         addMessage('error', data.message);
       }
@@ -238,9 +298,20 @@ document.addEventListener('DOMContentLoaded', function() {
   
   talkBtn.addEventListener('click', function() {
     console.log('[EVENT] Talk button clicked');
+    if (micStream) {
+      stopMic();
+      talkBtn.classList.remove('active');
+      return;
+    }
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       connect();
     }
+    startMic().then(function() {
+      talkBtn.classList.add('active');
+    }).catch(function(err) {
+      console.error('[MIC] Error:', err);
+      addMessage('error', 'Microphone unavailable: ' + err.message);
+    });
   });
   
   sendBtn.addEventListener('click', function() {
