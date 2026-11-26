@@ -1,0 +1,543 @@
+/**
+ * VoiceOps AI - Main Application Logic
+ * Based on working DevOps Shack code + text chat support
+ */
+
+// ============================================================
+// GLOBAL STATE
+// ============================================================
+
+const $ = (id) => document.getElementById(id);
+
+const orb = $("orb");
+const statusEl = $("status");
+const txEl = $("transcript");
+const activityEl = $("activity");
+const connBadge = $("connBadge");
+const talkBtn = $("talk");
+const chatInput = $("chatInput");
+const sendBtn = $("sendBtn");
+
+const BARGE_RMS = 0.02;
+
+let ws;
+let audioCtx;
+let workletNode;
+let micStream;
+
+let nextStart = 0;
+let activeSources = [];
+let speaking = false;
+let started = false;
+
+// Keep track of the currently streaming transcript bubble
+let activeTranscriptBubble = null;
+let activeTranscriptRole = null;
+
+// ============================================================
+// UI HELPERS
+// ============================================================
+
+function setOrb(state) {
+  orb.className = "orb " + state;
+}
+
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
+function setConnection(connected) {
+  connBadge.textContent = connected
+    ? "● Connected"
+    : "● Not connected";
+
+  connBadge.className = connected
+    ? "badge live"
+    : "badge";
+}
+
+function clearEmptyState(container) {
+  const empty = container.querySelector(".empty");
+  if (empty) {
+    empty.remove();
+  }
+}
+
+function timestamp() {
+  return new Date().toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+// ============================================================
+// TRANSCRIPT - MESSAGE DISPLAY
+// ============================================================
+
+function mergeTranscriptText(current, incoming) {
+  current = String(current || "");
+  incoming = String(incoming || "");
+
+  if (!incoming) {
+    return current;
+  }
+
+  if (!current) {
+    return incoming;
+  }
+
+  if (incoming.startsWith(current)) {
+    return incoming;
+  }
+
+  if (current === incoming || current.endsWith(incoming)) {
+    return current;
+  }
+
+  const maxOverlap = Math.min(current.length, incoming.length);
+
+  for (let i = maxOverlap; i > 0; i--) {
+    const endOfCurrent = current.slice(-i);
+    const startOfIncoming = incoming.slice(0, i);
+
+    if (endOfCurrent === startOfIncoming) {
+      return current + incoming.slice(i);
+    }
+  }
+
+  const currentEndsWithSpace = /\s$/.test(current);
+  const incomingStartsWithSpace = /^\s/.test(incoming);
+  const incomingStartsWithPunctuation = /^[,.;!?)}\]]/.test(incoming);
+
+  if (
+    currentEndsWithSpace ||
+    incomingStartsWithSpace ||
+    incomingStartsWithPunctuation
+  ) {
+    return current + incoming;
+  }
+
+  return current + " " + incoming;
+}
+
+function addLine(role, text) {
+  if (!text) {
+    return;
+  }
+
+  clearEmptyState(txEl);
+
+  if (
+    activeTranscriptBubble &&
+    activeTranscriptRole === role
+  ) {
+    const paragraph =
+      activeTranscriptBubble.querySelector("p");
+
+    paragraph.textContent = mergeTranscriptText(
+      paragraph.textContent,
+      text
+    );
+
+    txEl.scrollTop = txEl.scrollHeight;
+    return;
+  }
+
+  const wrap = document.createElement("div");
+  wrap.className = `bubble ${role}`;
+
+  wrap.innerHTML = `
+    <div class="meta">
+      <span>
+        ${role === "agent"
+          ? "VoiceOps Assistant"
+          : "You"}
+      </span>
+      <span>${timestamp()}</span>
+    </div>
+    <p></p>
+  `;
+
+  wrap.querySelector("p").textContent = text;
+  txEl.appendChild(wrap);
+
+  activeTranscriptBubble = wrap;
+  activeTranscriptRole = role;
+
+  txEl.scrollTop = txEl.scrollHeight;
+}
+
+// ============================================================
+// TOOL ACTIVITY
+// ============================================================
+
+function addActivity(item) {
+  clearEmptyState(activityEl);
+
+  const card = document.createElement("div");
+  const ok = item.ok !== false;
+
+  card.className = "activity-card";
+
+  const cmd = item.command
+    ? `<div class="command">
+         ${escapeHtml(item.command)}
+       </div>`
+    : "";
+
+  const details = item.details
+    ? `
+      <div class="footer-note" style="margin-top:10px;">
+        ${escapeHtml(item.details)}
+      </div>
+    `
+    : "";
+
+  card.innerHTML = `
+    <div class="meta">
+      <span>
+        ${escapeHtml(
+          item.title ||
+          item.name ||
+          "Tool execution"
+        )}
+      </span>
+      <span>${timestamp()}</span>
+    </div>
+
+    <div class="activity-status ${ok ? "" : "error"}">
+      ${
+        ok
+          ? "✓ Read-only tool completed"
+          : "✕ Tool returned an error"
+      }
+    </div>
+
+    <p style="margin-top:10px;">
+      ${escapeHtml(
+        item.summary || "Completed"
+      )}
+    </p>
+
+    ${cmd}
+    ${details}
+  `;
+
+  activityEl.appendChild(card);
+  activityEl.scrollTop = activityEl.scrollHeight;
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+// ============================================================
+// ASSISTANT AUDIO PLAYBACK (24kHz from Gemini)
+// ============================================================
+
+function playVoice(buf) {
+  const int16 = new Int16Array(buf);
+
+  const f32 = new Float32Array(int16.length);
+
+  for (let i = 0; i < int16.length; i++) {
+    f32[i] = int16[i] / 0x8000;
+  }
+
+  // Gemini output audio is 24 kHz PCM
+  const ab = audioCtx.createBuffer(1, f32.length, 24000);
+
+  ab.getChannelData(0).set(f32);
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = ab;
+  src.connect(audioCtx.destination);
+
+  const now = audioCtx.currentTime;
+
+  if (nextStart < now) {
+    nextStart = now;
+  }
+
+  src.start(nextStart);
+  nextStart += ab.duration;
+
+  activeSources.push(src);
+
+  src.onended = () => {
+    activeSources = activeSources.filter((s) => s !== src);
+
+    if (!activeSources.length) {
+      speaking = false;
+      setOrb("listening");
+      setStatus("Listening for your next question...");
+    }
+  };
+
+  speaking = true;
+  setOrb("speaking");
+  setStatus("Assistant is responding...");
+}
+
+function stopVoice() {
+  activeSources.forEach((source) => {
+    try {
+      source.stop();
+    } catch {}
+  });
+
+  activeSources = [];
+  nextStart = 0;
+  speaking = false;
+  setOrb("listening");
+  setStatus("Listening...");
+}
+
+// ============================================================
+// WEBSOCKET CONNECTION
+// ============================================================
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    setConnection(true);
+    setStatus("Live session connected. Speak now or type a message.");
+    setOrb("listening");
+    talkBtn.textContent = "● Live session active";
+    talkBtn.disabled = true;
+    chatInput.disabled = false;
+    sendBtn.disabled = false;
+  };
+
+  ws.onclose = () => {
+    setConnection(false);
+    setStatus(
+      "Connection dropped. Refresh the page to start again."
+    );
+    setOrb("idle");
+    started = false;
+    chatInput.disabled = true;
+    sendBtn.disabled = true;
+  };
+
+  ws.onmessage = (evt) => {
+    // Binary data = assistant voice audio
+    if (typeof evt.data !== "string") {
+      playVoice(evt.data);
+      return;
+    }
+
+    // JSON event
+    let m;
+    try {
+      m = JSON.parse(evt.data);
+    } catch (error) {
+      console.error("Invalid WebSocket message:", evt.data);
+      return;
+    }
+
+    // Transcript
+    if (m.type === "transcript") {
+      if (m.role === "user") {
+        setOrb("thinking");
+        setStatus("Processing your request...");
+        addLine("you", m.text);
+      } else {
+        addLine("agent", m.text);
+      }
+      return;
+    }
+
+    // Tool result
+    if (m.type === "tool_result") {
+      addActivity(m);
+      return;
+    }
+
+    // User interrupted assistant
+    if (m.type === "interrupted") {
+      stopVoice();
+      return;
+    }
+
+    // Error
+    if (m.type === "error") {
+      addActivity({
+        title: "Application error",
+        ok: false,
+        summary: m.message || "Unknown application error",
+      });
+      setStatus("Error occurred. Check logs or try again.");
+      return;
+    }
+  };
+
+  ws.onerror = (error) => {
+    console.error("WebSocket error:", error);
+  };
+}
+
+// ============================================================
+// MICROPHONE
+// ============================================================
+
+async function startMic() {
+  const AudioContextClass =
+    window.AudioContext || window.webkitAudioContext;
+
+  if (!AudioContextClass) {
+    throw new Error(
+      "Web Audio API is not supported by this browser."
+    );
+  }
+
+  audioCtx = new AudioContextClass();
+
+  if (audioCtx.state === "suspended") {
+    await audioCtx.resume();
+  }
+
+  if (!audioCtx.audioWorklet) {
+    throw new Error(
+      "AudioWorklet is not available. Use localhost or HTTPS."
+    );
+  }
+
+  await audioCtx.audioWorklet.addModule("/pcm-processor.js");
+
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
+  });
+
+  console.log("AudioContext sample rate:", audioCtx.sampleRate);
+
+  const audioTrack = micStream.getAudioTracks()[0];
+  if (audioTrack) {
+    console.log("Microphone settings:", audioTrack.getSettings());
+  }
+
+  const source = audioCtx.createMediaStreamSource(micStream);
+
+  workletNode = new AudioWorkletNode(audioCtx, "pcm-processor");
+
+  workletNode.port.onmessage = (e) => {
+    // Send PCM audio to backend
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(e.data.pcm);
+    }
+
+    // Barge-in detection
+    if (e.data.rms >= BARGE_RMS && speaking) {
+      stopVoice();
+    }
+  };
+
+  source.connect(workletNode);
+  workletNode.connect(audioCtx.destination);
+}
+
+// ============================================================
+// TEXT CHAT
+// ============================================================
+
+function sendTextMessage() {
+  const text = chatInput.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  // Show user message
+  addLine("you", text);
+
+  // Send to backend
+  ws.send(
+    JSON.stringify({
+      type: "text_input",
+      text: text,
+    })
+  );
+
+  chatInput.value = "";
+  setStatus("Processing your message...");
+}
+
+// ============================================================
+// START LIVE SESSION
+// ============================================================
+
+async function go() {
+  if (started) {
+    return;
+  }
+
+  started = true;
+  talkBtn.disabled = true;
+  talkBtn.textContent = "Initializing...";
+  setStatus("Preparing microphone and real-time session...");
+  setOrb("thinking");
+
+  try {
+    await startMic();
+    connect();
+  } catch (err) {
+    started = false;
+    talkBtn.disabled = false;
+    talkBtn.textContent = "🎙 Start Live Session";
+    setOrb("idle");
+
+    if (err.name === "NotAllowedError") {
+      setStatus("Microphone permission was denied.");
+    } else if (err.name === "NotFoundError") {
+      setStatus("No microphone was detected.");
+    } else {
+      setStatus("Could not start the live session. Check diagnostics.");
+    }
+
+    addActivity({
+      title: "Startup error",
+      ok: false,
+      summary: err.message || String(err),
+    });
+
+    console.error("Startup error:", err);
+  }
+}
+
+// ============================================================
+// EVENT LISTENERS
+// ============================================================
+
+talkBtn.addEventListener("click", go);
+
+if (sendBtn) {
+  sendBtn.addEventListener("click", sendTextMessage);
+}
+
+if (chatInput) {
+  chatInput.addEventListener("keypress", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendTextMessage();
+    }
+  });
+}
+
+// Suggested prompts
+document.querySelectorAll(".chip").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    setStatus(
+      `Suggested prompt: "${btn.dataset.prompt}" — speak it after starting the session.`
+    );
+  });
+});
