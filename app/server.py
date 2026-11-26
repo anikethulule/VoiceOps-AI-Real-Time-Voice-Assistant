@@ -63,38 +63,91 @@ def health():
 async def voice_socket(websocket: WebSocket):
     await websocket.accept()
     log.info("Browser connected")
-    
+
+    async def send_json(payload: dict):
+        await websocket.send_text(json.dumps(payload))
+
     try:
-        while True:
-            message = await websocket.receive()
-            text = message.get("text")
-            if text:
-                try:
-                    if isinstance(text, str):
-                        data = json.loads(text)
-                    else:
-                        data = text
-                    user_text = data.get("text", "").strip()
+        async with client.aio.live.connect(model=MODEL, config=LIVE_CONFIG) as session:
+
+            async def browser_to_gemini():
+                while True:
+                    message = await websocket.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        return
+                    audio = message.get("bytes")
+                    if audio:
+                        await session.send_realtime_input(
+                            audio=types.Blob(data=audio, mime_type="audio/pcm;rate=16000")
+                        )
+                        continue
+                    text = message.get("text")
+                    if not text:
+                        continue
+                    try:
+                        user_text = (json.loads(text).get("text") or "").strip()
+                    except json.JSONDecodeError:
+                        await send_json({"type": "error", "message": "Invalid JSON format"})
+                        continue
                     if user_text:
                         log.info("User: %s", user_text)
-                        # Send back a demo response
-                        response_text = f"Echo: You said '{user_text}'. I'm in demo mode - Gemini API not configured."
-                        await websocket.send_text(json.dumps({
-                            "type": "text",
-                            "text": response_text
-                        }))
-                except json.JSONDecodeError as e:
-                    log.error("JSON Error: %s", e)
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "Invalid JSON format"
-                    }))
-                except Exception as e:
-                    log.error("Error: %s", e)
+                        await session.send_realtime_input(text=user_text)
+
+            async def gemini_to_browser():
+                user_tx, model_tx = "", ""
+                while True:
+                    async for response in session.receive():
+                        if response.tool_call:
+                            replies = []
+                            for call in response.tool_call.function_calls:
+                                event, result = await asyncio.to_thread(
+                                    dispatch_tool, call.name, dict(call.args or {})
+                                )
+                                await send_json({"type": "tool", "event": event})
+                                replies.append(
+                                    types.FunctionResponse(id=call.id, name=call.name, response=result)
+                                )
+                            await session.send_tool_response(function_responses=replies)
+                            continue
+
+                        content = response.server_content
+                        if not content:
+                            continue
+                        if content.input_transcription and content.input_transcription.text:
+                            user_tx += content.input_transcription.text
+                        if content.output_transcription and content.output_transcription.text:
+                            model_tx += content.output_transcription.text
+                        if content.model_turn:
+                            for part in content.model_turn.parts or []:
+                                if part.inline_data and part.inline_data.data:
+                                    await websocket.send_bytes(part.inline_data.data)
+                        if content.interrupted:
+                            await send_json({"type": "interrupted"})
+                        if content.turn_complete:
+                            if user_tx.strip():
+                                await send_json({"type": "user", "text": user_tx.strip()})
+                            if model_tx.strip():
+                                await send_json({"type": "text", "text": model_tx.strip()})
+                            user_tx, model_tx = "", ""
+                            await send_json({"type": "turn_complete"})
+
+            tasks = [
+                asyncio.create_task(browser_to_gemini()),
+                asyncio.create_task(gemini_to_browser()),
+            ]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            for task in done:
+                task.result()
     except WebSocketDisconnect:
         log.info("Client disconnected")
     except Exception as e:
-        log.error("WebSocket error: %s", e)
+        log.exception("Gemini session error")
+        try:
+            await send_json({"type": "error", "message": f"Gemini error: {e}"})
+        except Exception:
+            pass
 
 
 FRONTEND = ROOT / "frontend"
