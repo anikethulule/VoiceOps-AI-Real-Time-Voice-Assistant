@@ -314,6 +314,13 @@ document.addEventListener('DOMContentLoaded', function() {
     });
   });
   
+  document.querySelectorAll('.chip[data-prompt]').forEach(function(chip) {
+    chip.addEventListener('click', function() {
+      chatInput.value = chip.dataset.prompt;
+      sendTextMessage();
+    });
+  });
+  
   sendBtn.addEventListener('click', function() {
     console.log('[EVENT] Send button clicked');
     sendTextMessage();
