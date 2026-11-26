@@ -318,7 +318,42 @@
 
     .message.user {
       flex-direction: row-reverse;
-      justify-content: flex-end;
+      justify-content: flex-start;
+    }
+
+    .message.assistant,
+    .message.error {
+      justify-content: flex-start;
+    }
+
+    .message-content {
+      max-width: 70%;
+      padding: 12px 16px;
+      border-radius: 14px;
+      word-wrap: break-word;
+      white-space: pre-wrap;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .message.user .message-content {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border-bottom-right-radius: 4px;
+      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+    }
+
+    .message.assistant .message-content {
+      background: #2d3748;
+      color: #e0e0e0;
+      border: 1px solid #374151;
+      border-bottom-left-radius: 4px;
+    }
+
+    .message.error .message-content {
+      background: rgba(239, 68, 68, 0.15);
+      color: #fca5a5;
+      border: 1px solid #ef4444;
     }
 
     .message-bubble {
@@ -549,6 +584,36 @@
       cursor: not-allowed;
     }
 
+    .stop-btn {
+      background: linear-gradient(135deg, #ef4444 0%, #b91c1c 100%);
+      box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3);
+    }
+
+    .conversation-item {
+      position: relative;
+    }
+
+    .conv-delete {
+      position: absolute;
+      top: 6px;
+      right: 8px;
+      background: none;
+      border: none;
+      color: #9ca3af;
+      cursor: pointer;
+      font-size: 14px;
+      opacity: 0;
+      transition: opacity 0.2s ease;
+    }
+
+    .conversation-item:hover .conv-delete {
+      opacity: 1;
+    }
+
+    .conv-delete:hover {
+      color: #ef4444;
+    }
+
     /* ===== RIGHT SIDEBAR - QUICK ACTIONS ===== */
     .sidebar-right {
       width: 280px;
@@ -765,6 +830,7 @@
             rows="1"
           ></textarea>
         </div>
+        <button id="stopBtn" class="send-btn stop-btn" title="Stop" style="display:none">■</button>
         <button id="sendBtn" class="send-btn" disabled>➤</button>
       </div>
     </div>
