@@ -66,6 +66,15 @@ function renderConversationsList() {
       ? (conv.messages[0].text || 'Chat').substring(0, 50)
       : 'New conversation';
     div.textContent = preview;
+    const del = document.createElement('button');
+    del.className = 'conv-delete';
+    del.title = 'Delete chat';
+    del.textContent = '✕';
+    del.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteConversation(conv.id);
+    });
+    div.appendChild(del);
     div.addEventListener('click', () => {
       currentConversationId = conv.id;
       currentMessages = conv.messages || [];
@@ -75,6 +84,47 @@ function renderConversationsList() {
     });
     conversationsList.appendChild(div);
   });
+}
+
+// Delete a conversation
+function deleteConversation(id) {
+  if (!confirm('Delete this chat?')) return;
+  conversations = conversations.filter(c => c.id !== id);
+  if (id === currentConversationId) {
+    stopAll();
+    if (conversations.length === 0) {
+      createNewConversation();
+      return;
+    }
+    currentConversationId = conversations[0].id;
+    currentMessages = conversations[0].messages || [];
+    renderMessages();
+  }
+  saveConversations();
+  renderConversationsList();
+}
+
+// Stop mic, playback and any pending response
+let stopBtn = null;
+let waiting = false;
+
+function updateStopBtn() {
+  if (stopBtn) stopBtn.style.display = (waiting || micStream || activeSources.length) ? 'flex' : 'none';
+}
+
+function stopAll() {
+  stopPlayback();
+  stopMic();
+  if (talkBtn) talkBtn.classList.remove('active');
+  waiting = false;
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+    ws = null;
+  }
+  if (statusEl) statusEl.textContent = 'Stopped';
+  if (sendBtn && chatInput) sendBtn.disabled = chatInput.value.trim().length === 0;
+  updateStopBtn();
 }
 
 // Clear messages display
@@ -143,6 +193,8 @@ function sendTextMessage() {
   sendBtn.disabled = true;
   
   const payload = JSON.stringify({ type: 'text', text: text });
+  waiting = true;
+  updateStopBtn();
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(payload);
   } else {
@@ -169,7 +221,8 @@ function playPcm(buffer) {
   src.start(playTime);
   playTime += audioBuf.duration;
   activeSources.push(src);
-  src.onended = () => { activeSources = activeSources.filter(s => s !== src); };
+  src.onended = () => { activeSources = activeSources.filter(s => s !== src); updateStopBtn(); };
+  updateStopBtn();
 }
 
 function stopPlayback() {
@@ -194,6 +247,7 @@ async function startMic() {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data.pcm);
   };
   source.connect(node);
+  updateStopBtn();
   if (playCtx && playCtx.state === 'suspended') playCtx.resume();
 }
 
@@ -202,6 +256,7 @@ function stopMic() {
   if (micCtx) micCtx.close();
   micStream = null;
   micCtx = null;
+  updateStopBtn();
 }
 
 // Connect to WebSocket
@@ -238,7 +293,12 @@ function connect() {
         addMessage('assistant', '🔧 ' + data.event.title + ': ' + data.event.summary);
       } else if (data.type === 'interrupted') {
         stopPlayback();
+      } else if (data.type === 'turn_complete') {
+        waiting = false;
+        updateStopBtn();
       } else if (data.type === 'error') {
+        waiting = false;
+        updateStopBtn();
         addMessage('error', data.message);
       }
     } catch (e) {
@@ -268,6 +328,8 @@ document.addEventListener('DOMContentLoaded', function() {
   talkBtn = document.getElementById('talk');
   chatInput = document.getElementById('chatInput');
   sendBtn = document.getElementById('sendBtn');
+  stopBtn = document.getElementById('stopBtn');
+  stopBtn.addEventListener('click', stopAll);
   newChatBtn = document.getElementById('newChatBtn');
   conversationsList = document.getElementById('conversationsList');
   settingsBtn = document.getElementById('settingsBtn');
