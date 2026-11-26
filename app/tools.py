@@ -126,7 +126,153 @@ TOOL_DECLARATIONS = [
         "description": "Get Docker system information (version, storage, containers count, images count).",
         "parameters": {"type": "object", "properties": {}},
     },
+    {
+        "name": "list_running_processes",
+        "description": "List the top running processes by memory usage on the environment running the voice assistant.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "check_network_status",
+        "description": "Check network status: hostname, interface traffic, listening TCP ports and internet connectivity.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "check_system_uptime",
+        "description": "Check how long the system has been running and its load average.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "check_security_status",
+        "description": "Run a basic read-only security check: user privileges, ports exposed on all interfaces and SSH settings.",
+        "parameters": {"type": "object", "properties": {}},
+    },
 ]
+
+
+def _listening_ports() -> Dict[int, str]:
+    """Return {port: bind_address} for TCP sockets in LISTEN state."""
+    ports: Dict[int, str] = {}
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                next(fh, None)
+                for line in fh:
+                    fields = line.split()
+                    if len(fields) > 3 and fields[3] == "0A":
+                        addr, port_hex = fields[1].rsplit(":", 1)
+                        ports.setdefault(int(port_hex, 16), addr)
+        except OSError:
+            continue
+    return ports
+
+
+def _is_wildcard(addr: str) -> bool:
+    return set(addr) == {"0"}
+
+
+def list_processes() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    command = "Read /proc/<pid>/status"
+    try:
+        procs = []
+        for pid in filter(str.isdigit, os.listdir("/proc")):
+            try:
+                with open(f"/proc/{pid}/status", "r", encoding="utf-8") as fh:
+                    info = dict(line.split(":", 1) for line in fh if ":" in line)
+                rss_kb = int(info.get("VmRSS", "0 kB").split()[0])
+                procs.append((rss_kb, int(pid), info.get("Name", "?").strip()))
+            except (OSError, ValueError):
+                continue
+        procs.sort(reverse=True)
+        top = [{"pid": pid, "name": name, "memory_mb": round(kb / 1024, 1)} for kb, pid, name in procs[:10]]
+        summary = f"{len(procs)} processes running. Top by memory: " + ", ".join(
+            f"{p['name']} (PID {p['pid']}, {p['memory_mb']} MB)" for p in top[:5]
+        )
+        details = "\n".join(f"{p['pid']}\t{p['name']}\t{p['memory_mb']} MB" for p in top)
+        return (
+            _event("list_running_processes", "Running Processes", summary, command, details),
+            {"result": "ok", "total_processes": len(procs), "top_by_memory": top, "summary": summary},
+        )
+    except Exception as exc:
+        summary = f"Could not list processes: {exc}"
+        return _event("list_running_processes", "Running Processes", summary, command, str(exc), False), {"result": "failed", "summary": summary}
+
+
+def network_status() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    command = "Read /proc/net/dev, /proc/net/tcp; connect 8.8.8.8:53"
+    try:
+        interfaces = []
+        with open("/proc/net/dev", "r", encoding="utf-8") as fh:
+            for line in list(fh)[2:]:
+                name, data = line.split(":", 1)
+                cols = data.split()
+                interfaces.append({
+                    "interface": name.strip(),
+                    "rx_mb": round(int(cols[0]) / 1024 ** 2, 1),
+                    "tx_mb": round(int(cols[8]) / 1024 ** 2, 1),
+                })
+        ports = sorted(_listening_ports())
+        try:
+            socket.create_connection(("8.8.8.8", 53), timeout=2).close()
+            internet = True
+        except OSError:
+            internet = False
+        host = socket.gethostname()
+        summary = (
+            f"Host {host}. Internet is {'reachable' if internet else 'not reachable'}. "
+            f"{len(ports)} TCP ports listening: {', '.join(map(str, ports[:15])) or 'none'}."
+        )
+        details = "\n".join(f"{i['interface']}: RX {i['rx_mb']} MB, TX {i['tx_mb']} MB" for i in interfaces)
+        return (
+            _event("check_network_status", "Network Status", summary, command, details),
+            {"result": "ok", "hostname": host, "internet_reachable": internet, "listening_ports": ports, "interfaces": interfaces, "summary": summary},
+        )
+    except Exception as exc:
+        summary = f"Could not read network status: {exc}"
+        return _event("check_network_status", "Network Status", summary, command, str(exc), False), {"result": "failed", "summary": summary}
+
+
+def system_uptime() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    command = "Read /proc/uptime, /proc/loadavg"
+    try:
+        with open("/proc/uptime", "r", encoding="utf-8") as fh:
+            seconds = int(float(fh.read().split()[0]))
+        with open("/proc/loadavg", "r", encoding="utf-8") as fh:
+            load = fh.read().split()[:3]
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes = rem // 60
+        summary = f"System has been up for {days} days, {hours} hours, {minutes} minutes. Load average (1/5/15 min): {', '.join(load)}."
+        return (
+            _event("check_system_uptime", "System Uptime", summary, command),
+            {"result": "ok", "uptime_seconds": seconds, "load_average": load, "summary": summary},
+        )
+    except Exception as exc:
+        summary = f"Could not read uptime: {exc}"
+        return _event("check_system_uptime", "System Uptime", summary, command, str(exc), False), {"result": "failed", "summary": summary}
+
+
+def security_status() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    command = "Check euid, /proc/net/tcp, /etc/ssh/sshd_config"
+    findings = []
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    if is_root:
+        findings.append("The assistant is running as root; use a non-root user.")
+    exposed = sorted(p for p, addr in _listening_ports().items() if _is_wildcard(addr))
+    if exposed:
+        findings.append(f"Ports listening on all interfaces: {', '.join(map(str, exposed[:15]))}.")
+    try:
+        with open("/etc/ssh/sshd_config", "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] in ("PermitRootLogin", "PasswordAuthentication") and parts[1].lower() == "yes":
+                    findings.append(f"SSH setting {parts[0]} is 'yes'.")
+    except OSError:
+        pass
+    summary = "Basic security check found: " + " ".join(findings) if findings else "Basic security check found no obvious issues."
+    return (
+        _event("check_security_status", "Security Check", summary, command, "\n".join(findings) or "No findings."),
+        {"result": "ok", "running_as_root": is_root, "exposed_ports": exposed, "findings": findings, "summary": summary},
+    )
 
 
 def _gb(value: float) -> float:
@@ -712,5 +858,13 @@ def dispatch_tool(name: str, args: dict):
         return docker_network_info()
     if name == "get_docker_system_info":
         return docker_system_info()
+    if name == "list_running_processes":
+        return list_processes()
+    if name == "check_network_status":
+        return network_status()
+    if name == "check_system_uptime":
+        return system_uptime()
+    if name == "check_security_status":
+        return security_status()
     summary = f"Tool '{name}' is not implemented in this local demo."
     return _event(name, "Unsupported Tool", summary, name, "Only read-only demo tools are exposed.", False), {"result": "failed", "summary": summary}
